@@ -1,12 +1,10 @@
-version: '3.8'
-
 services:
   crawler:
     image: laituanmanh/websearch-crawler:latest
     container_name: websearch-api
     restart: unless-stopped
-    ports:
-      - "3001:3001"
+    expose:
+      - "3001"
     environment:
       - NODE_ENV=production
       - PORT=3001
@@ -16,6 +14,21 @@ services:
       - flaresolverr
     volumes:
       - crawler_storage:/app/storage
+
+  websearch-mcp:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      MCP_TRANSPORT: http
+      MCP_API_KEY: ${MCP_API_KEY:?Set MCP_API_KEY in Dokploy environment variables}
+      API_URL: http://crawler:3001
+      MAX_SEARCH_RESULT: ${MAX_SEARCH_RESULT:-5}
+      PORT: 3000
+      HOST: 0.0.0.0
+    depends_on:
+      - crawler
 
   flaresolverr:
     image: 21hsmw/flaresolverr:nodriver

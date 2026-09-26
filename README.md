@@ -221,6 +221,18 @@ You can customize the crawler service by modifying the environment variables in 
 - `LOG_LEVEL`: Logging level (options: debug, info, warn, error)
 - `FLARESOLVERR_URL`: URL of the FlareSolverr service (for bypassing Cloudflare protection)
 
+## Hosting with Docker Compose / Dokploy
+
+The default transport remains `stdio` for MCP clients that launch the process locally. For a hosted MCP endpoint, set `MCP_TRANSPORT=http`; this starts a stateless Streamable HTTP server at `/mcp` on port `3000`.
+
+The HTTP endpoint requires a Bearer token. Set `MCP_API_KEY` to a long random secret in Dokploy's environment variables. Configure a domain for the `websearch-mcp` service on container port `3000`; the endpoint will be `https://your-domain/mcp` and the health endpoint is `/health`.
+
+The Compose stack also starts the crawler API and FlareSolverr, which the MCP server needs to perform searches. The crawler is internal to the Compose network and is not published to the internet. Set `API_URL` only if you run the MCP service separately from this stack.
+
+For a Dokploy Docker Compose deployment, create a Compose project from this repository and its `docker-compose.yml`, add `MCP_API_KEY` as a secret environment variable, deploy, then add a domain for `websearch-mcp` on port `3000`. The service listens on `0.0.0.0` for the Dokploy proxy.
+
+The HTTP transport implements MCP Streamable HTTP and authenticates every POST with `Authorization: Bearer <MCP_API_KEY>`. The client must support MCP initialization and send this authorization header on every request.
+
 ## Integrating with MCP Clients
 
 ### Quick Reference: MCP Configuration

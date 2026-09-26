@@ -2,6 +2,9 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import express from "express";
+import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import axios from "axios";
 
@@ -40,8 +43,8 @@ interface CrawlResponse {
   error: string | null;
 }
 
-// Main function to set up and run the MCP server
-async function main() {
+// Build the same MCP tools for both local stdio and hosted HTTP transports.
+function createMcpServer() {
   // Create an MCP server
   const server = new McpServer({
     name: "WebSearch-MCP",
@@ -170,6 +173,66 @@ async function main() {
       }
     }
   );
+
+  return server;
+}
+
+function isAuthorized(header: string | undefined, expectedKey: string): boolean {
+  if (!expectedKey || !header?.startsWith("Bearer ")) return false;
+  const supplied = Buffer.from(header.slice("Bearer ".length));
+  const expected = Buffer.from(expectedKey);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+async function startHttpServer() {
+  const apiKey = process.env.MCP_API_KEY || "";
+  if (!apiKey) {
+    throw new Error("MCP_API_KEY is required when MCP_TRANSPORT=http");
+  }
+
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+  app.post("/mcp", async (req, res) => {
+    if (!isAuthorized(req.header("authorization"), apiKey)) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: true,
+    });
+
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+    } catch (error) {
+      console.error("MCP HTTP request failed:", error);
+      if (!res.headersSent) res.status(500).json({ error: "MCP request failed" });
+    } finally {
+      await transport.close();
+      await server.close();
+    }
+  });
+
+  app.all("/mcp", (_req, res) => res.sendStatus(405));
+  app.listen(Number(process.env.PORT || 3000), process.env.HOST || "0.0.0.0", () => {
+    console.error(`WebSearch MCP listening on port ${process.env.PORT || 3000}`);
+    console.error(`Using crawler API: ${API_URL}`);
+  });
+}
+
+// Main function to select the MCP transport.
+async function main() {
+  if ((process.env.MCP_TRANSPORT || "stdio").toLowerCase() === "http") {
+    await startHttpServer();
+    return;
+  }
+
+  const server = createMcpServer();
 
   // Start receiving messages on stdin and sending messages on stdout
   console.error("Starting WebSearch MCP server...");
