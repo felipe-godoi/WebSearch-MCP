@@ -9,78 +9,277 @@ import { z } from "zod";
 import axios from "axios";
 
 // Configuration
-const API_URL = process.env.API_URL || "http://localhost:3001";
+const FIRECRAWL_API_URL = (
+  process.env.FIRECRAWL_API_URL ||
+  process.env.API_URL ||
+  "http://firecrawl-api:3002"
+).replace(/\/+$/, "");
+
+const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "";
 const MAX_SEARCH_RESULT = parseInt(process.env.MAX_SEARCH_RESULT || "5", 10);
 
-// Interface definitions based on swagger.json
-interface CrawlRequest {
+const CANDIDATE_BASE_URLS = [
+  FIRECRAWL_API_URL,
+  "http://firecrawl-api:3002",
+  "http://firecrawl-api:8080",
+  "http://10.0.1.60:3002",
+  "http://10.0.1.60:8080",
+].filter((url, idx, arr): url is string => Boolean(url) && arr.indexOf(url) === idx);
+
+let cachedWorkingBaseUrl: string | null = null;
+let cachedSearchEndpoint: string | null = null;
+let cachedScrapeEndpoint: string | null = null;
+
+interface FirecrawlSearchResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  markdown?: string;
+  text?: string;
+  metadata?: {
+    title?: string;
+    description?: string;
+    sourceURL?: string;
+    siteName?: string;
+    author?: string;
+    [key: string]: any;
+  };
+  [key: string]: any;
+}
+
+interface FirecrawlSearchResponse {
+  success?: boolean;
+  data?: FirecrawlSearchResult[];
+  results?: FirecrawlSearchResult[];
+  error?: string;
+  [key: string]: any;
+}
+
+interface FirecrawlScrapeResponse {
+  success?: boolean;
+  data?: {
+    markdown?: string;
+    html?: string;
+    rawHtml?: string;
+    metadata?: Record<string, any>;
+    [key: string]: any;
+  };
+  error?: string;
+  [key: string]: any;
+}
+
+function getFirecrawlHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (FIRECRAWL_API_KEY) {
+    headers["Authorization"] = `Bearer ${FIRECRAWL_API_KEY}`;
+  }
+  return headers;
+}
+
+async function executeFirecrawlSearch(params: {
   query: string;
   numResults?: number;
   language?: string;
   region?: string;
-  filters?: {
-    excludeDomains?: string[];
-    includeDomains?: string[];
-    excludeTerms?: string[];
-    resultType?: "all" | "news" | "blogs";
+  excludeDomains?: string[];
+  includeDomains?: string[];
+  excludeTerms?: string[];
+}): Promise<FirecrawlSearchResponse> {
+  let effectiveQuery = params.query;
+  if (params.includeDomains?.length) {
+    effectiveQuery += " " + params.includeDomains.map((d) => `site:${d}`).join(" ");
+  }
+  if (params.excludeDomains?.length) {
+    effectiveQuery += " " + params.excludeDomains.map((d) => `-site:${d}`).join(" ");
+  }
+  if (params.excludeTerms?.length) {
+    effectiveQuery += " " + params.excludeTerms.map((t) => `-"${t}"`).join(" ");
+  }
+
+  const limit = params.numResults ?? MAX_SEARCH_RESULT;
+  const requestBody = {
+    query: effectiveQuery.trim(),
+    limit,
+    lang: params.language,
+    country: params.region,
+    scrapeOptions: {
+      formats: ["markdown"],
+    },
   };
+
+  const headers = getFirecrawlHeaders();
+
+  // Try cached endpoint if already known
+  if (cachedWorkingBaseUrl && cachedSearchEndpoint) {
+    try {
+      const response = await axios.post<FirecrawlSearchResponse>(
+        `${cachedWorkingBaseUrl}${cachedSearchEndpoint}`,
+        requestBody,
+        { headers, timeout: 35000 }
+      );
+      if (response.data) {
+        return response.data;
+      }
+    } catch (err: any) {
+      console.warn(
+        `Cached Firecrawl search endpoint ${cachedWorkingBaseUrl}${cachedSearchEndpoint} failed (${err.message}). Probing candidate endpoints...`
+      );
+      cachedWorkingBaseUrl = null;
+      cachedSearchEndpoint = null;
+    }
+  }
+
+  const endpointCandidates = ["/v1/search", "/v2/search", "/search"];
+  let lastError: any = null;
+
+  for (const baseUrl of CANDIDATE_BASE_URLS) {
+    const cleanBase = baseUrl.replace(/\/+$/, "");
+    for (const endpoint of endpointCandidates) {
+      const fullUrl = `${cleanBase}${endpoint}`;
+      try {
+        console.error(`Attempting Firecrawl search via ${fullUrl}`);
+        const response = await axios.post<FirecrawlSearchResponse>(
+          fullUrl,
+          requestBody,
+          { headers, timeout: 35000 }
+        );
+
+        if (response.status === 200 && response.data) {
+          cachedWorkingBaseUrl = cleanBase;
+          cachedSearchEndpoint = endpoint;
+          console.error(`Firecrawl search connected successfully via ${fullUrl}`);
+          return response.data;
+        }
+      } catch (err: any) {
+        lastError = err;
+        if (err.code === "ECONNREFUSED") {
+          console.warn(`Connection refused at ${cleanBase}, skipping port/host...`);
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error("Failed to connect to any Firecrawl search endpoint");
 }
 
-interface CrawlResult {
-  url: string;
-  title: string;
-  excerpt: string;
-  text?: string;
-  html?: string;
-  siteName?: string;
-  byline?: string;
-  error?: string | null;
+async function executeFirecrawlScrape(
+  url: string,
+  formats: string[] = ["markdown"]
+): Promise<FirecrawlScrapeResponse> {
+  const requestBody = {
+    url,
+    formats,
+  };
+  const headers = getFirecrawlHeaders();
+
+  if (cachedWorkingBaseUrl && cachedScrapeEndpoint) {
+    try {
+      const response = await axios.post<FirecrawlScrapeResponse>(
+        `${cachedWorkingBaseUrl}${cachedScrapeEndpoint}`,
+        requestBody,
+        { headers, timeout: 35000 }
+      );
+      if (response.data) {
+        return response.data;
+      }
+    } catch (err: any) {
+      console.warn(
+        `Cached Firecrawl scrape endpoint ${cachedWorkingBaseUrl}${cachedScrapeEndpoint} failed (${err.message}). Probing candidate endpoints...`
+      );
+      cachedScrapeEndpoint = null;
+    }
+  }
+
+  const baseUrls = cachedWorkingBaseUrl
+    ? [cachedWorkingBaseUrl, ...CANDIDATE_BASE_URLS]
+    : CANDIDATE_BASE_URLS;
+  const endpointCandidates = ["/v1/scrape", "/v2/scrape", "/scrape"];
+  let lastError: any = null;
+
+  for (const baseUrl of baseUrls) {
+    const cleanBase = baseUrl.replace(/\/+$/, "");
+    for (const endpoint of endpointCandidates) {
+      const fullUrl = `${cleanBase}${endpoint}`;
+      try {
+        const response = await axios.post<FirecrawlScrapeResponse>(
+          fullUrl,
+          requestBody,
+          { headers, timeout: 35000 }
+        );
+
+        if (response.status === 200 && response.data) {
+          cachedWorkingBaseUrl = cleanBase;
+          cachedScrapeEndpoint = endpoint;
+          return response.data;
+        }
+      } catch (err: any) {
+        lastError = err;
+        if (err.code === "ECONNREFUSED") break;
+      }
+    }
+  }
+
+  throw lastError || new Error("Failed to connect to any Firecrawl scrape endpoint");
 }
 
-interface CrawlResponse {
-  query: string;
-  results: CrawlResult[];
-  error: string | null;
+function normalizeSearchResults(rawResponse: FirecrawlSearchResponse) {
+  const items: FirecrawlSearchResult[] = Array.isArray(rawResponse.data)
+    ? rawResponse.data
+    : Array.isArray(rawResponse.results)
+      ? rawResponse.results
+      : Array.isArray(rawResponse)
+        ? (rawResponse as any)
+        : [];
+
+  return items.map((item) => {
+    const title = item.title || item.metadata?.title || "";
+    const url = item.url || item.metadata?.sourceURL || "";
+    const snippet = item.description || item.metadata?.description || item.excerpt || "";
+    const text = item.markdown || item.text || snippet;
+    const siteName = item.metadata?.siteName || item.siteName || "";
+    const byline = item.metadata?.author || item.byline || "";
+
+    return {
+      title,
+      snippet,
+      text,
+      url,
+      siteName,
+      byline,
+    };
+  });
 }
 
-// Build the same MCP tools for both local stdio and hosted HTTP transports.
+// Build the MCP tools for both local stdio and hosted HTTP transports.
 function createMcpServer() {
-  // Create an MCP server
   const server = new McpServer({
     name: "WebSearch-MCP",
-    version: "1.0.0",
+    version: "2.0.0",
   });
 
-  // Add a web_search tool
+  // Add web_search tool (Firecrawl + SearXNG powered)
   server.tool(
     "web_search",
-    "Search the web for information.\n"
-    + "Use this tool when you need to search the web for information.\n"
-    + "You can use this tool to search for news, blogs, or all types of information.\n"
-    + "You can also use this tool to search for information about a specific company or product.\n"
-    + "You can also use this tool to search for information about a specific person.\n"
-    + "You can also use this tool to search for information about a specific product.\n"
-    + "You can also use this tool to search for information about a specific company.\n"
-    + "You can also use this tool to search for information about a specific event.\n"
-    + "You can also use this tool to search for information about a specific location.\n"
-    + "You can also use this tool to search for information about a specific thing.\n"
-    + "If you request search with 1 result number and failed, retry with bigger results number.",
+    "Search the web for information using Firecrawl and SearXNG.\n"
+    + "Use this tool to find real-time information, documentation, news, websites, and articles.\n"
+    + "Returns relevant search results with titles, URLs, snippets, and clean markdown content.",
     {
       query: z.string().describe("The search query to look up"),
       numResults: z
         .number()
         .optional()
-        .describe(
-          `Number of results to return (default: ${MAX_SEARCH_RESULT})`
-        ),
+        .describe(`Number of results to return (default: ${MAX_SEARCH_RESULT})`),
       language: z
         .string()
         .optional()
-        .describe("Language code for search results (e.g., 'en')"),
+        .describe("Language code for search results (e.g., 'en', 'pt')"),
       region: z
         .string()
         .optional()
-        .describe("Region code for search results (e.g., 'us')"),
+        .describe("Region/country code for search results (e.g., 'us', 'br')"),
       excludeDomains: z
         .array(z.string())
         .optional()
@@ -100,45 +299,18 @@ function createMcpServer() {
     },
     async (params) => {
       try {
-        console.error(`Performing web search for: ${params.query}`);
+        console.error(`[WebSearch-MCP] Performing Firecrawl web search for: ${params.query}`);
 
-        // Prepare request payload for crawler API
-        const requestPayload: CrawlRequest = {
-          query: params.query,
-          numResults: params.numResults ?? MAX_SEARCH_RESULT,
-          language: params.language,
-          region: params.region,
-          filters: {
-            excludeDomains: params.excludeDomains,
-            includeDomains: params.includeDomains,
-            excludeTerms: params.excludeTerms,
-            resultType: params.resultType as "all" | "news" | "blogs",
-          },
-        };
+        const responseData = await executeFirecrawlSearch(params);
 
-        // Call the crawler API
-        console.error(`Sending request to ${API_URL}/crawl`);
-        const response = await axios.post<CrawlResponse>(
-          `${API_URL}/crawl`,
-          requestPayload
-        );
-
-        if (response.data.error && (!response.data.results || response.data.results.length === 0)) {
+        if (responseData.error && (!responseData.data || responseData.data.length === 0)) {
           return {
-            content: [{ type: "text", text: `Search error: ${response.data.error}` }],
+            content: [{ type: "text", text: `Search error: ${responseData.error}` }],
             isError: true,
           };
         }
 
-        // Format the response for the MCP client
-        const results = (response.data.results || []).map((result) => ({
-          title: result.title,
-          snippet: result.excerpt || (result as any).snippet || "",
-          text: result.text || result.excerpt || (result as any).snippet || "",
-          url: result.url,
-          siteName: result.siteName || "",
-          byline: result.byline || "",
-        }));
+        const results = normalizeSearchResults(responseData);
 
         return {
           content: [
@@ -146,8 +318,8 @@ function createMcpServer() {
               type: "text",
               text: JSON.stringify(
                 {
-                  query: response.data.query,
-                  results: results,
+                  query: params.query,
+                  results,
                 },
                 null,
                 2
@@ -156,12 +328,15 @@ function createMcpServer() {
           ],
         };
       } catch (error) {
-        console.error("Error performing web search:", error);
+        console.error("[WebSearch-MCP] Error performing web search:", error);
 
         if (axios.isAxiosError(error)) {
-          const errorMessage = error.response?.data?.error || error.message;
+          const errorMessage =
+            error.response?.data?.error ||
+            error.response?.data?.message ||
+            error.message;
           return {
-            content: [{ type: "text", text: `Error: ${errorMessage}` }],
+            content: [{ type: "text", text: `Firecrawl Search Error: ${errorMessage}` }],
             isError: true,
           };
         }
@@ -170,9 +345,76 @@ function createMcpServer() {
           content: [
             {
               type: "text",
-              text: `Error: ${
-                error instanceof Error ? error.message : "Unknown error"
-              }`,
+              text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Add scrape_url tool
+  server.tool(
+    "scrape_url",
+    "Scrape a specific web page URL and extract its full content as clean markdown using Firecrawl.\n"
+    + "Use this when you need the complete text/markdown or metadata of a specific webpage.",
+    {
+      url: z.string().url().describe("The URL of the webpage to scrape"),
+      formats: z
+        .array(z.enum(["markdown", "html", "rawHtml"]))
+        .optional()
+        .describe("Formats to extract (default: ['markdown'])"),
+    },
+    async (params) => {
+      try {
+        console.error(`[WebSearch-MCP] Scraping URL with Firecrawl: ${params.url}`);
+        const responseData = await executeFirecrawlScrape(params.url, params.formats || ["markdown"]);
+
+        if (responseData.error && !responseData.data) {
+          return {
+            content: [{ type: "text", text: `Scrape error: ${responseData.error}` }],
+            isError: true,
+          };
+        }
+
+        const data = responseData.data || {};
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  url: params.url,
+                  markdown: data.markdown || "",
+                  metadata: data.metadata || {},
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        console.error("[WebSearch-MCP] Error scraping URL:", error);
+
+        if (axios.isAxiosError(error)) {
+          const errorMessage =
+            error.response?.data?.error ||
+            error.response?.data?.message ||
+            error.message;
+          return {
+            content: [{ type: "text", text: `Firecrawl Scrape Error: ${errorMessage}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: ${error instanceof Error ? error.message : "Unknown error"}`,
             },
           ],
           isError: true,
@@ -198,9 +440,30 @@ async function startHttpServer() {
   }
 
   const app = express();
-  app.use(express.json({ limit: "1mb" }));
-  app.get("/health", (_req, res) => res.json({ status: "ok" }));
+  app.use(express.json({ limit: "2mb" }));
 
+  // Health endpoint
+  app.get("/health", (_req, res) => {
+    res.json({
+      status: "ok",
+      backend: "firecrawl",
+      firecrawlBaseUrl: cachedWorkingBaseUrl || FIRECRAWL_API_URL,
+      searchEndpoint: cachedSearchEndpoint || "auto-detect",
+    });
+  });
+
+  // Backward compatibility endpoint for /crawl
+  app.post("/crawl", async (req, res) => {
+    try {
+      const responseData = await executeFirecrawlSearch(req.body);
+      const results = normalizeSearchResults(responseData);
+      res.json({ query: req.body.query, results, error: null });
+    } catch (err: any) {
+      res.status(500).json({ query: req.body.query, results: [], error: err.message });
+    }
+  });
+
+  // MCP Streamable HTTP transport endpoint
   app.post("/mcp", async (req, res) => {
     if (!isAuthorized(req.header("authorization"), apiKey)) {
       res.status(401).json({ error: "Unauthorized" });
@@ -217,7 +480,7 @@ async function startHttpServer() {
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
-      console.error("MCP HTTP request failed:", error);
+      console.error("[WebSearch-MCP] MCP HTTP request failed:", error);
       if (!res.headersSent) res.status(500).json({ error: "MCP request failed" });
     } finally {
       await transport.close();
@@ -226,9 +489,13 @@ async function startHttpServer() {
   });
 
   app.all("/mcp", (_req, res) => res.sendStatus(405));
-  app.listen(Number(process.env.PORT || 3000), process.env.HOST || "0.0.0.0", () => {
-    console.error(`WebSearch MCP listening on port ${process.env.PORT || 3000}`);
-    console.error(`Using crawler API: ${API_URL}`);
+
+  const port = Number(process.env.PORT || 3000);
+  const host = process.env.HOST || "0.0.0.0";
+
+  app.listen(port, host, () => {
+    console.error(`[WebSearch-MCP] Listening on ${host}:${port}`);
+    console.error(`[WebSearch-MCP] Target Firecrawl API: ${FIRECRAWL_API_URL}`);
   });
 }
 
@@ -241,16 +508,14 @@ async function main() {
 
   const server = createMcpServer();
 
-  // Start receiving messages on stdin and sending messages on stdout
-  console.error("Starting WebSearch MCP server...");
-  console.error(`Using API_URL: ${API_URL}`);
+  console.error("[WebSearch-MCP] Starting WebSearch MCP server (stdio mode)...");
+  console.error(`[WebSearch-MCP] Target Firecrawl API: ${FIRECRAWL_API_URL}`);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("WebSearch MCP server started");
+  console.error("[WebSearch-MCP] WebSearch MCP server started");
 }
 
-// Start the server
 main().catch((error) => {
-  console.error("Failed to start WebSearch MCP server:", error);
+  console.error("[WebSearch-MCP] Failed to start:", error);
   process.exit(1);
 });

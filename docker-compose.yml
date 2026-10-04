@@ -1,28 +1,4 @@
 services:
-  crawler:
-    build:
-      context: ./crawler
-      dockerfile: Dockerfile
-    container_name: websearch-api
-    restart: unless-stopped
-    expose:
-      - "3001"
-    environment:
-      - NODE_ENV=production
-      - PORT=3001
-      - LOG_LEVEL=info
-      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
-    depends_on:
-      - flaresolverr
-    volumes:
-      - crawler_storage:/app/storage
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').request('http://localhost:3001/health/live', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()\""]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
   websearch-mcp:
     build: .
     restart: unless-stopped
@@ -31,20 +7,20 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_API_KEY: ${MCP_API_KEY:?Set MCP_API_KEY in Dokploy environment variables}
-      API_URL: http://crawler:3001
+      FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-http://firecrawl-api:3002}
+      FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       MAX_SEARCH_RESULT: ${MAX_SEARCH_RESULT:-5}
       PORT: 3000
       HOST: 0.0.0.0
-    depends_on:
-      - crawler
+    networks:
+      - dokploy-network
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').request('http://localhost:3000/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
-  flaresolverr:
-    image: 21hsmw/flaresolverr:nodriver
-    container_name: flaresolverr
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=info
-      - TZ=UTC
-
-volumes:
-  crawler_storage:
+networks:
+  dokploy-network:
+    external: true
