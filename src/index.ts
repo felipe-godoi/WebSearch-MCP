@@ -123,11 +123,18 @@ function createMcpServer() {
           requestPayload
         );
 
+        if (response.data.error && (!response.data.results || response.data.results.length === 0)) {
+          return {
+            content: [{ type: "text", text: `Search error: ${response.data.error}` }],
+            isError: true,
+          };
+        }
+
         // Format the response for the MCP client
-        const results = response.data.results.map((result) => ({
+        const results = (response.data.results || []).map((result) => ({
           title: result.title,
-          snippet: result.excerpt,
-          text: result.text,
+          snippet: result.excerpt || (result as any).snippet || "",
+          text: result.text || result.excerpt || (result as any).snippet || "",
           url: result.url,
           siteName: result.siteName || "",
           byline: result.byline || "",

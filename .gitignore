@@ -2,9 +2,10 @@
 node_modules/
 
 # Build outputs
-dist/
+/dist/
 build/
 *.tsbuildinfo
+!crawler/dist/
 
 # Logs
 logs
