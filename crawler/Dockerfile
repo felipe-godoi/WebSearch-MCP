@@ -22,6 +22,6 @@ USER appuser
 EXPOSE 3001
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "require('http').request('http://localhost:' + (process.env.PORT || 3001) + '/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()"
+  CMD node -e "require('http').request('http://localhost:' + (process.env.PORT || 3001) + '/health/live', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()"
 
 CMD ["node", "dist/index.js"]

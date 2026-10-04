@@ -17,7 +17,7 @@ services:
     volumes:
       - crawler_storage:/app/storage
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').request('http://localhost:3001/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()\""]
+      test: ["CMD-SHELL", "node -e \"require('http').request('http://localhost:3001/health/live', (r) => { process.exit(r.statusCode === 200 ? 0 : 1) }).end()\""]
       interval: 30s
       timeout: 5s
       retries: 3

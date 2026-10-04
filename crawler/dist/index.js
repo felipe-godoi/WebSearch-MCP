@@ -56,6 +56,8 @@ app.post('/crawl', crawlerController.crawl);
 app.post('/clean', crawlerController.cleanContent);
 // Cache management endpoint
 app.post('/clear-cache', crawlerController.clearCache);
+// Liveness probe endpoint
+app.get('/health/live', (_req, res) => res.json({ status: 'ok' }));
 // Health check endpoint
 app.get('/health', crawlerController.healthCheck);
 // Start the server
