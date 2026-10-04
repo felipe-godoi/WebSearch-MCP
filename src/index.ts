@@ -7,6 +7,14 @@ import express from "express";
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import axios from "axios";
+import {
+  assertPublicDnsResolution,
+  assertSafePublicUrl,
+  isInternalHostname,
+  isSafePublicUrl,
+  resolveAndValidateFinalUrl,
+  SecurityError,
+} from "./ssrf.js";
 
 // Configuration
 const FIRECRAWL_API_URL = (
@@ -78,6 +86,62 @@ function getFirecrawlHeaders(): Record<string, string> {
   return headers;
 }
 
+/**
+ * Validates search query and domain filters to ensure they do not target
+ * internal network addresses, containers, or private IP ranges.
+ */
+async function validateSearchInputs(params: {
+  query: string;
+  includeDomains?: string[];
+  excludeDomains?: string[];
+}): Promise<void> {
+  // Check if query contains internal URLs or hostnames
+  const queryTokens = params.query.split(/\s+/);
+  for (const token of queryTokens) {
+    const cleanToken = token.replace(/^[<"'(]+|[>"')]+$/g, "");
+    if (cleanToken.includes("://") || cleanToken.startsWith("site:")) {
+      const rawHost = cleanToken.replace(/^site:/i, "");
+      try {
+        const withProto = rawHost.includes("://") ? rawHost : `http://${rawHost}`;
+        const parsed = new URL(withProto);
+        if (parsed.hostname && isInternalHostname(parsed.hostname)) {
+          throw new SecurityError(
+            `Search query targets internal or private hostname "${parsed.hostname}". Access is blocked (SSRF protection).`
+          );
+        }
+      } catch (e: any) {
+        if (e instanceof SecurityError) throw e;
+      }
+    }
+  }
+
+  // Validate includeDomains
+  if (params.includeDomains?.length) {
+    for (const domain of params.includeDomains) {
+      const clean = domain.trim().toLowerCase();
+      if (isInternalHostname(clean)) {
+        throw new SecurityError(
+          `Domain "${domain}" in includeDomains is an internal or private address. Access is blocked (SSRF protection).`
+        );
+      }
+      await assertPublicDnsResolution(clean);
+    }
+  }
+
+  // Validate excludeDomains
+  if (params.excludeDomains?.length) {
+    for (const domain of params.excludeDomains) {
+      const clean = domain.trim().toLowerCase();
+      if (isInternalHostname(clean)) {
+        throw new SecurityError(
+          `Domain "${domain}" in excludeDomains is an internal or private address. Access is blocked (SSRF protection).`
+        );
+      }
+      await assertPublicDnsResolution(clean);
+    }
+  }
+}
+
 async function executeFirecrawlSearch(params: {
   query: string;
   numResults?: number;
@@ -87,6 +151,9 @@ async function executeFirecrawlSearch(params: {
   includeDomains?: string[];
   excludeTerms?: string[];
 }): Promise<FirecrawlSearchResponse> {
+  // Pre-validate search inputs against SSRF attacks
+  await validateSearchInputs(params);
+
   let effectiveQuery = params.query;
   if (params.includeDomains?.length) {
     effectiveQuery += " " + params.includeDomains.map((d) => `site:${d}`).join(" ");
@@ -257,15 +324,16 @@ function normalizeSearchResults(rawResponse: FirecrawlSearchResponse) {
 function createMcpServer() {
   const server = new McpServer({
     name: "WebSearch-MCP",
-    version: "2.0.0",
+    version: "2.1.0",
   });
 
-  // Add web_search tool (Firecrawl + SearXNG powered)
+  // Add web_search tool (Firecrawl + SearXNG powered with strict SSRF protection)
   server.tool(
     "web_search",
     "Search the web for information using Firecrawl and SearXNG.\n"
     + "Use this tool to find real-time information, documentation, news, websites, and articles.\n"
-    + "Returns relevant search results with titles, URLs, snippets, and clean markdown content.",
+    + "Returns relevant search results with titles, URLs, snippets, and clean markdown content.\n"
+    + "Note: Internal, private, or local network destinations are strictly blocked for security.",
     {
       query: z.string().describe("The search query to look up"),
       numResults: z
@@ -310,7 +378,19 @@ function createMcpServer() {
           };
         }
 
-        const results = normalizeSearchResults(responseData);
+        const rawResults = normalizeSearchResults(responseData);
+
+        // Security filter: Verify that NONE of the search result URLs point to private/internal networks
+        const safeResults = [];
+        for (const item of rawResults) {
+          if (item.url && (await isSafePublicUrl(item.url))) {
+            safeResults.push(item);
+          } else {
+            console.warn(
+              `[WebSearch-MCP] SSRF Filter: Dropped search result with internal or unsafe URL: ${item.url}`
+            );
+          }
+        }
 
         return {
           content: [
@@ -319,7 +399,7 @@ function createMcpServer() {
               text: JSON.stringify(
                 {
                   query: params.query,
-                  results,
+                  results: safeResults,
                 },
                 null,
                 2
@@ -329,6 +409,13 @@ function createMcpServer() {
         };
       } catch (error) {
         console.error("[WebSearch-MCP] Error performing web search:", error);
+
+        if (error instanceof SecurityError) {
+          return {
+            content: [{ type: "text", text: `Security Error: ${error.message}` }],
+            isError: true,
+          };
+        }
 
         if (axios.isAxiosError(error)) {
           const errorMessage =
@@ -354,13 +441,14 @@ function createMcpServer() {
     }
   );
 
-  // Add scrape_url tool
+  // Add scrape_url tool with strict SSRF validation and redirect verification
   server.tool(
     "scrape_url",
     "Scrape a specific web page URL and extract its full content as clean markdown using Firecrawl.\n"
-    + "Use this when you need the complete text/markdown or metadata of a specific webpage.",
+    + "Use this when you need the complete text/markdown or metadata of a specific webpage.\n"
+    + "Note: Internal, private, or local network destinations are strictly blocked for security.",
     {
-      url: z.string().url().describe("The URL of the webpage to scrape"),
+      url: z.string().url().describe("The public web URL of the webpage to scrape"),
       formats: z
         .array(z.enum(["markdown", "html", "rawHtml"]))
         .optional()
@@ -368,8 +456,13 @@ function createMcpServer() {
     },
     async (params) => {
       try {
-        console.error(`[WebSearch-MCP] Scraping URL with Firecrawl: ${params.url}`);
-        const responseData = await executeFirecrawlScrape(params.url, params.formats || ["markdown"]);
+        console.error(`[WebSearch-MCP] SSRF validating URL: ${params.url}`);
+
+        // Validate URL against private networks, Docker hostnames, loopbacks, and inspect redirects
+        const safeUrl = await resolveAndValidateFinalUrl(params.url);
+
+        console.error(`[WebSearch-MCP] Scraping verified safe public URL: ${safeUrl}`);
+        const responseData = await executeFirecrawlScrape(safeUrl, params.formats || ["markdown"]);
 
         if (responseData.error && !responseData.data) {
           return {
@@ -386,7 +479,7 @@ function createMcpServer() {
               type: "text",
               text: JSON.stringify(
                 {
-                  url: params.url,
+                  url: safeUrl,
                   markdown: data.markdown || "",
                   metadata: data.metadata || {},
                 },
@@ -398,6 +491,13 @@ function createMcpServer() {
         };
       } catch (error) {
         console.error("[WebSearch-MCP] Error scraping URL:", error);
+
+        if (error instanceof SecurityError) {
+          return {
+            content: [{ type: "text", text: `Security Error: ${error.message}` }],
+            isError: true,
+          };
+        }
 
         if (axios.isAxiosError(error)) {
           const errorMessage =
@@ -449,6 +549,7 @@ async function startHttpServer() {
       backend: "firecrawl",
       firecrawlBaseUrl: cachedWorkingBaseUrl || FIRECRAWL_API_URL,
       searchEndpoint: cachedSearchEndpoint || "auto-detect",
+      ssrfProtection: "active",
     });
   });
 
@@ -456,10 +557,17 @@ async function startHttpServer() {
   app.post("/crawl", async (req, res) => {
     try {
       const responseData = await executeFirecrawlSearch(req.body);
-      const results = normalizeSearchResults(responseData);
-      res.json({ query: req.body.query, results, error: null });
+      const rawResults = normalizeSearchResults(responseData);
+      const safeResults = [];
+      for (const item of rawResults) {
+        if (item.url && (await isSafePublicUrl(item.url))) {
+          safeResults.push(item);
+        }
+      }
+      res.json({ query: req.body.query, results: safeResults, error: null });
     } catch (err: any) {
-      res.status(500).json({ query: req.body.query, results: [], error: err.message });
+      const statusCode = err instanceof SecurityError ? 403 : 500;
+      res.status(statusCode).json({ query: req.body.query, results: [], error: err.message });
     }
   });
 
@@ -496,6 +604,7 @@ async function startHttpServer() {
   app.listen(port, host, () => {
     console.error(`[WebSearch-MCP] Listening on ${host}:${port}`);
     console.error(`[WebSearch-MCP] Target Firecrawl API: ${FIRECRAWL_API_URL}`);
+    console.error("[WebSearch-MCP] SSRF Protection: ACTIVE");
   });
 }
 
@@ -510,6 +619,7 @@ async function main() {
 
   console.error("[WebSearch-MCP] Starting WebSearch MCP server (stdio mode)...");
   console.error(`[WebSearch-MCP] Target Firecrawl API: ${FIRECRAWL_API_URL}`);
+  console.error("[WebSearch-MCP] SSRF Protection: ACTIVE");
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[WebSearch-MCP] WebSearch MCP server started");
