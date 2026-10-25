@@ -15,6 +15,13 @@ import {
   resolveAndValidateFinalUrl,
   SecurityError,
 } from "./ssrf.js";
+import {
+  DEFAULT_PAGE_TIMEOUT_MS,
+  DEFAULT_SCRAPE_TIMEOUT_MS,
+  DEFAULT_SEARCH_TIMEOUT_MS,
+  FirecrawlClient,
+  normalizeSearchResults,
+} from "./firecrawl.js";
 
 // Configuration
 const FIRECRAWL_API_URL = (
@@ -26,6 +33,11 @@ const FIRECRAWL_API_URL = (
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "";
 const MAX_SEARCH_RESULT = parseInt(process.env.MAX_SEARCH_RESULT || "5", 10);
 
+const positiveInt = (value: string | undefined, fallback: number): number => {
+  const parsed = parseInt(value || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
 const CANDIDATE_BASE_URLS = [
   FIRECRAWL_API_URL,
   "http://firecrawl-api:3002",
@@ -34,57 +46,15 @@ const CANDIDATE_BASE_URLS = [
   "http://10.0.1.60:8080",
 ].filter((url, idx, arr): url is string => Boolean(url) && arr.indexOf(url) === idx);
 
-let cachedWorkingBaseUrl: string | null = null;
-let cachedSearchEndpoint: string | null = null;
-let cachedScrapeEndpoint: string | null = null;
-
-interface FirecrawlSearchResult {
-  title?: string;
-  url?: string;
-  description?: string;
-  markdown?: string;
-  text?: string;
-  metadata?: {
-    title?: string;
-    description?: string;
-    sourceURL?: string;
-    siteName?: string;
-    author?: string;
-    [key: string]: any;
-  };
-  [key: string]: any;
-}
-
-interface FirecrawlSearchResponse {
-  success?: boolean;
-  data?: FirecrawlSearchResult[];
-  results?: FirecrawlSearchResult[];
-  error?: string;
-  [key: string]: any;
-}
-
-interface FirecrawlScrapeResponse {
-  success?: boolean;
-  data?: {
-    markdown?: string;
-    html?: string;
-    rawHtml?: string;
-    metadata?: Record<string, any>;
-    [key: string]: any;
-  };
-  error?: string;
-  [key: string]: any;
-}
-
-function getFirecrawlHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (FIRECRAWL_API_KEY) {
-    headers["Authorization"] = `Bearer ${FIRECRAWL_API_KEY}`;
-  }
-  return headers;
-}
+// Firecrawl search scrapes every result, which takes 20-40 s on a cold start,
+// and heavy pages need up to a minute: the old 35 s timeout cut both.
+const firecrawl = new FirecrawlClient({
+  baseUrls: CANDIDATE_BASE_URLS,
+  apiKey: FIRECRAWL_API_KEY,
+  searchTimeoutMs: positiveInt(process.env.FIRECRAWL_SEARCH_TIMEOUT_MS, DEFAULT_SEARCH_TIMEOUT_MS),
+  scrapeTimeoutMs: positiveInt(process.env.FIRECRAWL_SCRAPE_TIMEOUT_MS, DEFAULT_SCRAPE_TIMEOUT_MS),
+  pageTimeoutMs: positiveInt(process.env.FIRECRAWL_PAGE_TIMEOUT_MS, DEFAULT_PAGE_TIMEOUT_MS),
+});
 
 /**
  * Validates search query and domain filters to ensure they do not target
@@ -150,7 +120,7 @@ async function executeFirecrawlSearch(params: {
   excludeDomains?: string[];
   includeDomains?: string[];
   excludeTerms?: string[];
-}): Promise<FirecrawlSearchResponse> {
+}) {
   // Pre-validate search inputs against SSRF attacks
   await validateSearchInputs(params);
 
@@ -165,159 +135,16 @@ async function executeFirecrawlSearch(params: {
     effectiveQuery += " " + params.excludeTerms.map((t) => `-"${t}"`).join(" ");
   }
 
-  const limit = params.numResults ?? MAX_SEARCH_RESULT;
-  const requestBody = {
+  return firecrawl.search({
     query: effectiveQuery.trim(),
-    limit,
-    lang: params.language,
-    country: params.region,
-    scrapeOptions: {
-      formats: ["markdown"],
-    },
-  };
-
-  const headers = getFirecrawlHeaders();
-
-  // Try cached endpoint if already known
-  if (cachedWorkingBaseUrl && cachedSearchEndpoint) {
-    try {
-      const response = await axios.post<FirecrawlSearchResponse>(
-        `${cachedWorkingBaseUrl}${cachedSearchEndpoint}`,
-        requestBody,
-        { headers, timeout: 35000 }
-      );
-      if (response.data) {
-        return response.data;
-      }
-    } catch (err: any) {
-      console.warn(
-        `Cached Firecrawl search endpoint ${cachedWorkingBaseUrl}${cachedSearchEndpoint} failed (${err.message}). Probing candidate endpoints...`
-      );
-      cachedWorkingBaseUrl = null;
-      cachedSearchEndpoint = null;
-    }
-  }
-
-  const endpointCandidates = ["/v1/search", "/v2/search", "/search"];
-  let lastError: any = null;
-
-  for (const baseUrl of CANDIDATE_BASE_URLS) {
-    const cleanBase = baseUrl.replace(/\/+$/, "");
-    for (const endpoint of endpointCandidates) {
-      const fullUrl = `${cleanBase}${endpoint}`;
-      try {
-        console.error(`Attempting Firecrawl search via ${fullUrl}`);
-        const response = await axios.post<FirecrawlSearchResponse>(
-          fullUrl,
-          requestBody,
-          { headers, timeout: 35000 }
-        );
-
-        if (response.status === 200 && response.data) {
-          cachedWorkingBaseUrl = cleanBase;
-          cachedSearchEndpoint = endpoint;
-          console.error(`Firecrawl search connected successfully via ${fullUrl}`);
-          return response.data;
-        }
-      } catch (err: any) {
-        lastError = err;
-        if (err.code === "ECONNREFUSED") {
-          console.warn(`Connection refused at ${cleanBase}, skipping port/host...`);
-          break;
-        }
-      }
-    }
-  }
-
-  throw lastError || new Error("Failed to connect to any Firecrawl search endpoint");
-}
-
-async function executeFirecrawlScrape(
-  url: string,
-  formats: string[] = ["markdown"]
-): Promise<FirecrawlScrapeResponse> {
-  const requestBody = {
-    url,
-    formats,
-  };
-  const headers = getFirecrawlHeaders();
-
-  if (cachedWorkingBaseUrl && cachedScrapeEndpoint) {
-    try {
-      const response = await axios.post<FirecrawlScrapeResponse>(
-        `${cachedWorkingBaseUrl}${cachedScrapeEndpoint}`,
-        requestBody,
-        { headers, timeout: 35000 }
-      );
-      if (response.data) {
-        return response.data;
-      }
-    } catch (err: any) {
-      console.warn(
-        `Cached Firecrawl scrape endpoint ${cachedWorkingBaseUrl}${cachedScrapeEndpoint} failed (${err.message}). Probing candidate endpoints...`
-      );
-      cachedScrapeEndpoint = null;
-    }
-  }
-
-  const baseUrls = cachedWorkingBaseUrl
-    ? [cachedWorkingBaseUrl, ...CANDIDATE_BASE_URLS]
-    : CANDIDATE_BASE_URLS;
-  const endpointCandidates = ["/v1/scrape", "/v2/scrape", "/scrape"];
-  let lastError: any = null;
-
-  for (const baseUrl of baseUrls) {
-    const cleanBase = baseUrl.replace(/\/+$/, "");
-    for (const endpoint of endpointCandidates) {
-      const fullUrl = `${cleanBase}${endpoint}`;
-      try {
-        const response = await axios.post<FirecrawlScrapeResponse>(
-          fullUrl,
-          requestBody,
-          { headers, timeout: 35000 }
-        );
-
-        if (response.status === 200 && response.data) {
-          cachedWorkingBaseUrl = cleanBase;
-          cachedScrapeEndpoint = endpoint;
-          return response.data;
-        }
-      } catch (err: any) {
-        lastError = err;
-        if (err.code === "ECONNREFUSED") break;
-      }
-    }
-  }
-
-  throw lastError || new Error("Failed to connect to any Firecrawl scrape endpoint");
-}
-
-function normalizeSearchResults(rawResponse: FirecrawlSearchResponse) {
-  const items: FirecrawlSearchResult[] = Array.isArray(rawResponse.data)
-    ? rawResponse.data
-    : Array.isArray(rawResponse.results)
-      ? rawResponse.results
-      : Array.isArray(rawResponse)
-        ? (rawResponse as any)
-        : [];
-
-  return items.map((item) => {
-    const title = item.title || item.metadata?.title || "";
-    const url = item.url || item.metadata?.sourceURL || "";
-    const snippet = item.description || item.metadata?.description || item.excerpt || "";
-    const text = item.markdown || item.text || snippet;
-    const siteName = item.metadata?.siteName || item.siteName || "";
-    const byline = item.metadata?.author || item.byline || "";
-
-    return {
-      title,
-      snippet,
-      text,
-      url,
-      siteName,
-      byline,
-    };
+    limit: params.numResults ?? MAX_SEARCH_RESULT,
+    language: params.language,
+    region: params.region,
   });
+}
+
+function executeFirecrawlScrape(url: string, formats: string[] = ["markdown"]) {
+  return firecrawl.scrape(url, formats);
 }
 
 // Build the MCP tools for both local stdio and hosted HTTP transports.
@@ -371,14 +198,14 @@ function createMcpServer() {
 
         const responseData = await executeFirecrawlSearch(params);
 
-        if (responseData.error && (!responseData.data || responseData.data.length === 0)) {
+        const rawResults = normalizeSearchResults(responseData);
+
+        if (responseData.error && rawResults.length === 0) {
           return {
             content: [{ type: "text", text: `Search error: ${responseData.error}` }],
             isError: true,
           };
         }
-
-        const rawResults = normalizeSearchResults(responseData);
 
         // Security filter: Verify that NONE of the search result URLs point to private/internal networks
         const safeResults = [];
@@ -392,6 +219,13 @@ function createMcpServer() {
           }
         }
 
+        if (rawResults.length === 0) {
+          // Make an empty answer diagnosable from the logs: which shape came back?
+          console.warn(
+            `[WebSearch-MCP] Firecrawl returned no results for "${params.query}" (response keys: ${Object.keys(responseData || {}).join(",") || "none"})`
+          );
+        }
+
         return {
           content: [
             {
@@ -400,6 +234,12 @@ function createMcpServer() {
                 {
                   query: params.query,
                   results: safeResults,
+                  ...(safeResults.length === 0
+                    ? {
+                        warning:
+                          "No results. The search engines behind Firecrawl may be rate-limited; retry later or scrape a known URL with scrape_url.",
+                      }
+                    : {}),
                 },
                 null,
                 2
@@ -547,8 +387,8 @@ async function startHttpServer() {
     res.json({
       status: "ok",
       backend: "firecrawl",
-      firecrawlBaseUrl: cachedWorkingBaseUrl || FIRECRAWL_API_URL,
-      searchEndpoint: cachedSearchEndpoint || "auto-detect",
+      firecrawlBaseUrl: firecrawl.workingBaseUrl || FIRECRAWL_API_URL,
+      searchEndpoint: firecrawl.searchEndpoint || "auto-detect",
       ssrfProtection: "active",
     });
   });

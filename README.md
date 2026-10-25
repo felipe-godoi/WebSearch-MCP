@@ -67,6 +67,9 @@ The WebSearch MCP server can be configured using environment variables:
 
 - `API_URL`: The URL of the WebSearch Crawler API (default: `http://localhost:3001`)
 - `MAX_SEARCH_RESULT`: Maximum number of search results to return when not specified in the request (default: `5`)
+- `FIRECRAWL_SEARCH_TIMEOUT_MS`: How long to wait for Firecrawl's `/search` (search plus scrape of every result, 20-40 s on a cold start; default `90000`)
+- `FIRECRAWL_SCRAPE_TIMEOUT_MS`: How long to wait for Firecrawl's `/scrape` (default `90000`)
+- `FIRECRAWL_PAGE_TIMEOUT_MS`: Per-page timeout sent to Firecrawl in the scrape options (default `60000`)
 
 Examples:
 ```bash
